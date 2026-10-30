@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Couple's Shared Ledger & Home Fund Tracker</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Chart.js for visualization -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <!-- Firebase SDK Modules -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, addDoc, deleteDoc, onSnapshot, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global Firebase Configuration & State
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'shared-ledger-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+            apiKey: "demo-api-key",
+            authDomain: "demo.firebaseapp.com",
+            projectId: "demo-project",
+            storageBucket: "demo.appspot.com",
+            messagingSenderId: "123456789",
+            appId: "1:123456789:web:demo"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        // Path for shared public ledger entries
+        const LEDGER_COLLECTION_PATH = ['artifacts', appId, 'public', 'data', 'ledger_entries'];
+
+        let unsubscribeLedger = null;
+
+        // Initialize Authentication & Cloud Listener
+        async function initCloudDatabase() {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // Update UI badge
+                const syncBadge = document.getElementById('cloudSyncBadge');
+                if (syncBadge) {
+                    syncBadge.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-500 inline-block animate-pulse"></span> Cloud Connected`;
+                    syncBadge.className = "text-xs px-2 py-1 bg-emerald-50 text-emerald-700 rounded-lg flex items-center gap-1.5 font-medium";
+                }
+
+                listenToCloudLedger();
+            } catch (err) {
+                console.error("Cloud Auth/Database initialization error:", err);
+                const syncBadge = document.getElementById('cloudSyncBadge');
+                if (syncBadge) {
+                    syncBadge.innerHTML = `<span class="w-2 h-2 rounded-full bg-amber-500 inline-block"></span> Offline Mode (Local)`;
+                    syncBadge.className = "text-xs px-2 py-1 bg-amber-50 text-amber-700 rounded-lg flex items-center gap-1.5 font-medium";
+                }
+                // Fallback to local storage
+                loadSampleOrLocalData();
+                renderLedger();
+                initChart();
+            }
+        }
+
+        // Real-time Cloud Listener
+        function listenToCloudLedger() {
+            if (!auth.currentUser) return;
+
+            const ledgerRef = collection(db, ...LEDGER_COLLECTION_PATH);
+
+            unsubscribeLedger = onSnapshot(ledgerRef, (snapshot) => {
+                const cloudItems = [];
+                snapshot.forEach((docSnap) => {
+                    cloudItems.push({
+                        id: docSnap.id,
+                        ...docSnap.data()
+                    });
+                });
+
+                // Update app state
+                window.transactions = cloudItems;
+                window.renderLedger();
+                window.updateChart();
+            }, (error) => {
+                console.error("Error listening to cloud ledger:", error);
+            });
+        }
+
+        // Add Transaction to Cloud
+        window.saveTransactionToCloud = async function(txData) {
+            if (!auth.currentUser) {
+                // Local fallback
+                window.transactions.unshift({ id: 'tx-' + Date.now(), ...txData });
+                window.saveData();
+                window.renderLedger();
+                window.updateChart();
+                return;
+            }
+
+            try {
+                const ledgerRef = collection(db, ...LEDGER_COLLECTION_PATH);
+                await addDoc(ledgerRef, txData);
+            } catch (err) {
+                console.error("Failed to add transaction to cloud:", err);
+                window.showModal('Cloud Error', 'Could not save entry to cloud. Please check your internet connection.', 'alert-circle', 'rose');
+            }
+        };
+
+        // Delete Transaction from Cloud
+        window.deleteTransactionFromCloud = async function(docId) {
+            if (!auth.currentUser || docId.startsWith('tx-')) {
+                // Local delete fallback
+                window.transactions = window.transactions.filter(t => t.id !== docId);
+                window.saveData();
+                window.renderLedger();
+                window.updateChart();
+                return;
+            }
+
+            try {
+                const docRef = doc(db, ...LEDGER_COLLECTION_PATH, docId);
+                await deleteDoc(docRef);
+            } catch (err) {
+                console.error("Failed to delete transaction from cloud:", err);
+                window.showModal('Cloud Error', 'Could not delete entry from cloud.', 'alert-circle', 'rose');
+            }
+        };
+
+        // Clear All Transactions from Cloud
+        window.clearAllCloudTransactions = async function() {
+            if (!auth.currentUser) {
+                window.transactions = [];
+                localStorage.removeItem('couple_ledger_data');
+                window.renderLedger();
+                window.updateChart();
+                return;
+            }
+
+            try {
+                const ledgerRef = collection(db, ...LEDGER_COLLECTION_PATH);
+                const snapshot = await getDocs(ledgerRef);
+                const deletePromises = snapshot.docs.map(docSnap => deleteDoc(docSnap.ref));
+                await Promise.all(deletePromises);
+            } catch (err) {
+                console.error("Failed to clear cloud transactions:", err);
+            }
+        };
+
+        // Start cloud connection when ready
+        initCloudDatabase();
+    </script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Custom scrollbar for transaction table */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen pb-12">
+
+    <!-- Top Navigation Header -->
+    <header class="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="p-2 bg-indigo-50 text-indigo-600 rounded-xl">
+                    <i data-lucide="book-open-check" class="w-6 h-6"></i>
+                </div>
+                <div>
+                    <h1 class="text-lg font-bold text-slate-900 leading-tight">Home & Business Ledger</h1>
+                    <p class="text-xs text-slate-500">Shared Financial Transparency Log</p>
+                </div>
+            </div>
+            
+            <div class="flex items-center gap-2">
+                <div id="cloudSyncBadge" class="text-xs px-2 py-1 bg-slate-100 text-slate-500 rounded-lg flex items-center gap-1.5 font-medium">
+                    <span class="w-2 h-2 rounded-full bg-slate-400 inline-block animate-pulse"></span> Connecting...
+                </div>
+                <button onclick="exportToCSV()" class="flex items-center gap-1.5 text-xs sm:text-sm font-medium text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 px-3 py-2 rounded-lg transition-colors">
+                    <i data-lucide="download" class="w-4 h-4"></i>
+                    <span class="hidden sm:inline">Export CSV</span>
+                </button>
+                <button onclick="clearAllDataPrompt()" class="flex items-center gap-1.5 text-xs sm:text-sm font-medium text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 px-3 py-2 rounded-lg transition-colors">
+                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                    <span class="hidden sm:inline">Reset</span>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+        <!-- LEFT COLUMN: Summary & Entry Form (4 cols on lg) -->
+        <div class="lg:col-span-4 space-y-6">
+
+            <!-- Overview Cards -->
+            <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200/80 space-y-4">
+                <h2 class="text-xs font-bold text-slate-400 uppercase tracking-wider">Fund Summary</h2>
+                
+                <!-- Main Balance -->
+                <div class="p-4 bg-indigo-600 text-white rounded-xl shadow-md shadow-indigo-100">
+                    <span class="text-xs font-medium text-indigo-200">Current Fund Balance</span>
+                    <div id="netBalance" class="text-3xl font-extrabold tracking-tight mt-1">₱0.00</div>
+                    <div class="mt-2 text-xs text-indigo-100 flex items-center gap-1">
+                        <i data-lucide="shield-check" class="w-3.5 h-3.5"></i> Total Available Funds
+                    </div>
+                </div>
+
+                <!-- Secondary Totals -->
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="p-3 bg-emerald-50 border border-emerald-100 rounded-xl">
+                        <div class="flex items-center gap-1.5 text-emerald-700 text-xs font-medium">
+                            <i data-lucide="arrow-down-left" class="w-4 h-4"></i> Total Sent
+                        </div>
+                        <p id="totalInflow" class="text-lg font-bold text-emerald-900 mt-1">₱0.00</p>
+                    </div>
+                    <div class="p-3 bg-rose-50 border border-rose-100 rounded-xl">
+                        <div class="flex items-center gap-1.5 text-rose-700 text-xs font-medium">
+                            <i data-lucide="arrow-up-right" class="w-4 h-4"></i> Total Spent
+                        </div>
+                        <p id="totalOutflow" class="text-lg font-bold text-rose-900 mt-1">₱0.00</p>
+                    </div>
+                </div>
+
+                <!-- Category Breakdown Small Chart -->
+                <div class="pt-2">
+
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="p-3 bg-emerald-50 border border-emerald-100 rounded-xl">
+                        <div class="flex items-center gap-1.5 text-emerald-700 text-xs font-medium">
+                            <i data-lucide="arrow-down-left" class="w-4 h-4"></i> Total Sent
+                        </div>
+                        <p id="totalInflow" class="text-lg font-bold text-emerald-900 mt-1">$0.00</p>
+                    </div>
+                    <div class="p-3 bg-rose-50 border border-rose-100 rounded-xl">
+                        <div class="flex items-center gap-1.5 text-rose-700 text-xs font-medium">
+                            <i data-lucide="arrow-up-right" class="w-4 h-4"></i> Total Spent
+                        </div>
+                        <p id="totalOutflow" class="text-lg font-bold text-rose-900 mt-1">$0.00</p>
+                    </div>
+                </div>
+
+                <!-- Category Breakdown Small Chart -->
+                <div class="pt-2">
+                    <h3 class="text-xs font-semibold text-slate-500 mb-2">Spending Breakdown</h3>
+                    <div class="h-40 relative">
+                        <canvas id="categoryChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Transaction Form Card -->
+            <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200/80">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
+                        <i data-lucide="plus-circle" class="w-5 h-5 text-indigo-600"></i>
+                        Record Transaction
+                    </h2>
+                </div>
+
+                <form id="transactionForm" class="space-y-4" onsubmit="handleAddTransaction(event)">
+                    <!-- Type Selection -->
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Transaction Type</label>
+                        <div class="grid grid-cols-2 gap-2">
+                            <label class="cursor-pointer">
+                                <input type="radio" name="txType" value="transfer" checked class="peer sr-only" onchange="toggleCategoryOptions()">
+                                <div class="p-2.5 text-center text-xs font-medium rounded-xl border border-slate-200 peer-checked:border-emerald-500 peer-checked:bg-emerald-50 peer-checked:text-emerald-700 transition-all flex items-center justify-center gap-1.5">
+                                    <i data-lucide="arrow-down-left" class="w-4 h-4 text-emerald-600"></i>
+                                    Money Sent (Deposit)
+                                </div>
+                            </label>
+                            <label class="cursor-pointer">
+                                <input type="radio" name="txType" value="expense" class="peer sr-only" onchange="toggleCategoryOptions()">
+                                <div class="p-2.5 text-center text-xs font-medium rounded-xl border border-slate-200 peer-checked:border-rose-500 peer-checked:bg-rose-50 peer-checked:text-rose-700 transition-all flex items-center justify-center gap-1.5">
+                                    <i data-lucide="arrow-up-right" class="w-4 h-4 text-rose-600"></i>
+                                    Money Spent (Expense)
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Category Selection -->
+                    <div>
+                        <label for="category" class="block text-xs font-semibold text-slate-600 mb-1">Category</label>
+                        <select id="category" class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50">
+                            <!-- Populated dynamically -->
+                        </select>
+                    </div>
+
+                    <!-- Amount & Date Row -->
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label for="amount" class="block text-xs font-semibold text-slate-600 mb-1">Amount (₱)</label>
+                            <input type="number" id="amount" step="0.01" min="0.01" required placeholder="0.00" class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50">
+                        </div>
+                        <div>
+                            <label for="date" class="block text-xs font-semibold text-slate-600 mb-1">Date</label>
+                            <input type="date" id="date" required class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50">
+                        </div>
+                    </div>
+
+                    <!-- Sender / Receiver Info -->
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label for="payer" class="block text-xs font-semibold text-slate-600 mb-1">Paid / Sent By</label>
+                            <input type="text" id="payer" placeholder="e.g., You" class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50">
+                        </div>
+                        <div>
+                            <label for="recipient" class="block text-xs font-semibold text-slate-600 mb-1">Received / Paid To</label>
+                            <input type="text" id="recipient" placeholder="e.g., Girlfriend / Contractor" class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50">
+                        </div>
+                    </div>
+
+                    <!-- Description / Memo -->
+                    <div>
+                        <label for="description" class="block text-xs font-semibold text-slate-600 mb-1">Description / Memo</label>
+                        <input type="text" id="description" required placeholder="e.g., Downpayment for kitchen tiles" class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50">
+                    </div>
+
+                    <!-- Reference / Receipt Note -->
+                    <div>
+                        <label for="refNo" class="block text-xs font-semibold text-slate-600 mb-1">Ref / Receipt # (Optional)</label>
+                        <input type="text" id="refNo" placeholder="Bank ref, check #, invoice ID" class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50">
+                    </div>
+
+                    <button type="submit" id="submitBtn" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium text-sm py-2.5 rounded-xl shadow-md shadow-indigo-100 transition-all flex items-center justify-center gap-2 cursor-pointer">
+                        <i data-lucide="plus" class="w-4 h-4"></i> Add Entry to Ledger
+                    </button>
+                </form>
+            </div>
+
+        </div>
+
+        <!-- RIGHT COLUMN: Ledger Table & Filters (8 cols on lg) -->
+        <div class="lg:col-span-8 space-y-6">
+
+            <!-- Filter & Search Bar -->
+            <div class="bg-white p-4 rounded-2xl shadow-sm border border-slate-200/80 flex flex-col sm:flex-row items-center justify-between gap-3">
+                <div class="relative w-full sm:w-64">
+                    <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"></i>
+                    <input type="text" id="searchInput" onkeyup="filterTransactions()" placeholder="Search description or ref..." class="w-full text-sm pl-9 pr-3 py-2 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50">
+                </div>
+
+                <div class="flex items-center gap-2 w-full sm:w-auto">
+                    <!-- Category Filter -->
+                    <select id="filterCategory" onchange="filterTransactions()" class="text-xs sm:text-sm border border-slate-200 rounded-xl px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50 flex-grow sm:flex-grow-0">
+                        <option value="ALL">All Categories</option>
+                        <option value="Transfer">Transfers / Savings</option>
+                        <option value="House Payment">House Payments</option>
+                        <option value="Business">Business Fund</option>
+                        <option value="Miscellaneous">Miscellaneous</option>
+                    </select>
+
+                    <!-- Type Filter -->
+                    <select id="filterType" onchange="filterTransactions()" class="text-xs sm:text-sm border border-slate-200 rounded-xl px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-slate-50/50">
+                        <option value="ALL">All Types</option>
+                        <option value="transfer">Money In (+)</option>
+                        <option value="expense">Money Out (-)</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Ledger Table Container -->
+            <div class="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
+                <div class="p-4 border-b border-slate-100 flex items-center justify-between">
+                    <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
+                        <i data-lucide="list-tree" class="w-5 h-5 text-indigo-600"></i>
+                        Transaction History
+                    </h2>
+                    <span id="transactionCount" class="text-xs text-slate-500 font-medium">0 Entries</span>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-slate-50/80 border-b border-slate-100 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                                <th class="py-3 px-4">Date</th>
+                                <th class="py-3 px-4">Category</th>
+                                <th class="py-3 px-4">Description / Ref</th>
+                                <th class="py-3 px-4">Parties</th>
+                                <th class="py-3 px-4 text-right">In (+)</th>
+                                <th class="py-3 px-4 text-right">Out (-)</th>
+                                <th class="py-3 px-4 text-right">Balance</th>
+                                <th class="py-3 px-4 text-center">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ledgerTableBody" class="divide-y divide-slate-100 text-sm">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Empty State -->
+                <div id="emptyState" class="hidden p-12 text-center">
+                    <div class="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-3 text-slate-400">
+                        <i data-lucide="inbox" class="w-6 h-6"></i>
+                    </div>
+                    <p class="text-slate-600 font-medium text-sm">No transactions recorded yet.</p>
+                    <p class="text-slate-400 text-xs mt-1">Start by filling out the entry form on the left!</p>
+                </div>
+            </div>
+
+            <!-- Category Summary Cards Grid -->
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div class="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm flex items-center gap-3">
+                    <div class="p-3 bg-blue-50 text-blue-600 rounded-xl">
+                        <i data-lucide="home" class="w-5 h-5"></i>
+                    </div>
+                    <div>
+                        <p class="text-xs font-medium text-slate-400 uppercase">House Payments</p>
+                        <p id="categoryHouseTotal" class="text-lg font-bold text-slate-800">₱0.00</p>
+                    </div>
+                </div>
+
+                <div class="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm flex items-center gap-3">
+                    <div class="p-3 bg-amber-50 text-amber-600 rounded-xl">
+                        <i data-lucide="briefcase" class="w-5 h-5"></i>
+                    </div>
+                    <div>
+                        <p class="text-xs font-medium text-slate-400 uppercase">Business Fund</p>
+                        <p id="categoryBusinessTotal" class="text-lg font-bold text-slate-800">₱0.00</p>
+                    </div>
+                </div>
+
+                <div class="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm flex items-center gap-3">
+                    <div class="p-3 bg-purple-50 text-purple-600 rounded-xl">
+                        <i data-lucide="grid" class="w-5 h-5"></i>
+                    </div>
+                    <div>
+                        <p class="text-xs font-medium text-slate-400 uppercase">Miscellaneous</p>
+                        <p id="categoryMiscTotal" class="text-lg font-bold text-slate-800">₱0.00</p>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <!-- Custom Modal for Notifications / Confirmation -->
+    <div id="modalOverlay" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-100 text-center space-y-4">
+            <div id="modalIconContainer" class="w-12 h-12 rounded-full mx-auto flex items-center justify-center bg-indigo-50 text-indigo-600">
+                <i id="modalIcon" data-lucide="info" class="w-6 h-6"></i>
+            </div>
+            <div>
+                <h3 id="modalTitle" class="text-lg font-bold text-slate-900">Notice</h3>
+                <p id="modalMessage" class="text-xs text-slate-500 mt-1">Modal body message goes here.</p>
+            </div>
+            <div id="modalActions" class="flex gap-2 justify-center pt-2">
+                <button onclick="closeModal()" class="w-full py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium text-xs rounded-xl transition-colors">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Application Script -->
+    <script>
+        // State Management
+        let transactions = [];
+        let categoryChartInstance = null;
+        let pendingDeleteId = null;
+
+        // Categories mapping
+        const TRANSFER_CATEGORY = "Transfer";
+        const EXPENSE_CATEGORIES = ["House Payment", "Business", "Miscellaneous"];
+
+        // Initialize App
+        window.onload = function () {
+            // Set default date to today
+            document.getElementById('date').value = new Date().toISOString().split('T')[0];
+
+            // Load saved data if present
+            loadSampleOrLocalData();
+            
+            // Setup dynamic dropdown options
+            toggleCategoryOptions();
+
+            // Render components
+            renderLedger();
+            initChart();
+
+            // Refresh lucide icons
+            lucide.createIcons();
+        };
+
+        // Load Sample Data on First Launch
+        function loadSampleOrLocalData() {
+            const saved = localStorage.getItem('couple_ledger_data');
+            if (saved) {
+                try {
+                    transactions = JSON.parse(saved);
+                    return;
+                } catch(e) { console.error("Error parsing saved ledger data", e); }
+            }
+
+            // Default sample entries if empty
+            const today = new Date().toISOString().split('T')[0];
+            transactions = [
+                {
+                    id: 'tx-1',
+                    date: today,
+                    type: 'transfer',
+                    category: 'Transfer',
+                    amount: 50000.00,
+                    payer: 'Boyfriend',
+                    recipient: 'Me',
+                    description: 'Remittance for home savings fund',
+                    refNo: 'GCASH-982112'
+                },
+                {
+                    id: 'tx-2',
+                    date: today,
+                    type: 'expense',
+                    category: 'House Payment',
+                    amount: 15000.00,
+                    payer: 'Me',
+                    recipient: 'Architect / Developer',
+                    description: 'Initial deposit for architectural blueprint design',
+                    refNo: 'INV-0012'
+                },
+                {
+                    id: 'tx-3',
+                    date: today,
+                    type: 'expense',
+                    category: 'Business',
+                    amount: 8500.00,
+                    payer: 'Me',
+                    recipient: 'Supplier',
+                    description: 'Inventory payment for business startup',
+                    refNo: 'SUP-4421'
+                },
+                {
+                    id: 'tx-4',
+                    date: today,
+                    type: 'expense',
+                    category: 'Miscellaneous',
+                    amount: 1200.00,
+                    payer: 'Me',
+                    recipient: 'Notary Public',
+                    description: 'Document notarization fees for land title',
+                    refNo: 'RCPT-88'
+                }
+            ];
+            saveData();
+        }
+
+        function saveData() {
+            localStorage.setItem('couple_ledger_data', JSON.stringify(transactions));
+        }
+
+        // Toggle Category dropdown based on Transfer vs Expense
+        function toggleCategoryOptions() {
+            const txType = document.querySelector('input[name="txType"]:checked').value;
+            const categorySelect = document.getElementById('category');
+            const payerInput = document.getElementById('payer');
+            const recipientInput = document.getElementById('recipient');
+
+            categorySelect.innerHTML = '';
+
+            if (txType === 'transfer') {
+                const opt = document.createElement('option');
+                opt.value = TRANSFER_CATEGORY;
+                opt.textContent = "Transfer (Fund Deposit)";
+                categorySelect.appendChild(opt);
+
+                payerInput.value = "Boyfriend";
+                recipientInput.value = "Me";
+            } else {
+                EXPENSE_CATEGORIES.forEach(cat => {
+                    const opt = document.createElement('option');
+                    opt.value = cat;
+                    opt.textContent = cat;
+                    categorySelect.appendChild(opt);
+                });
+
+                payerInput.value = "Me";
+                recipientInput.value = "Vendor / Service";
+            }
+        }
+
+        // Add Transaction Handler
+        function handleAddTransaction(e) {
+            e.preventDefault();
+
+            const type = document.querySelector('input[name="txType"]:checked').value;
+            const category = document.getElementById('category').value;
+            const amount = parseFloat(document.getElementById('amount').value);
+            const date = document.getElementById('date').value;
+            const payer = document.getElementById('payer').value.trim() || 'Unspecified';
+            const recipient = document.getElementById('recipient').value.trim() || 'Unspecified';
+            const description = document.getElementById('description').value.trim();
+            const refNo = document.getElementById('refNo').value.trim();
+
+            if (isNaN(amount) || amount <= 0) {
+                showModal('Invalid Amount', 'Please enter a valid amount greater than 0.', 'alert-circle', 'rose');
+                return;
+            }
+
+            const newTx = {
+                date,
+                type,
+                category,
+                amount,
+                payer,
+                recipient,
+                description,
+                refNo,
+                createdAt: new Date().toISOString()
+            };
+
+            // Save via Cloud function
+            if (typeof window.saveTransactionToCloud === 'function') {
+                window.saveTransactionToCloud(newTx);
+            } else {
+                transactions.unshift({ id: 'tx-' + Date.now(), ...newTx });
+                saveData();
+                renderLedger();
+                updateChart();
+            }
+
+            // Reset form fields
+            document.getElementById('amount').value = '';
+            document.getElementById('description').value = '';
+            document.getElementById('refNo').value = '';
+
+            showModal('Entry Saved', 'Transaction was successfully logged to the cloud database.', 'check-circle', 'emerald');
+        }
+
+        // Confirm Delete
+        function confirmDelete() {
+            if (pendingDeleteId) {
+                if (typeof window.deleteTransactionFromCloud === 'function') {
+                    window.deleteTransactionFromCloud(pendingDeleteId);
+                } else {
+                    transactions = transactions.filter(t => t.id !== pendingDeleteId);
+                    saveData();
+                    renderLedger();
+                    updateChart();
+                }
+                pendingDeleteId = null;
+            }
+            closeModal();
+        }
+
+        function executeClearAll() {
+            if (typeof window.clearAllCloudTransactions === 'function') {
+                window.clearAllCloudTransactions();
+            } else {
+                transactions = [];
+                localStorage.removeItem('couple_ledger_data');
+                renderLedger();
+                updateChart();
+            }
+            closeModal();
+        }
+
+        // Render Ledger Table & Calculate Balances
+        function renderLedger() {
+            const tbody = document.getElementById('ledgerTableBody');
+            const emptyState = document.getElementById('emptyState');
+            tbody.innerHTML = '';
+
+            // Filter logic
+            const searchKeyword = document.getElementById('searchInput').value.toLowerCase();
+            const filterCat = document.getElementById('filterCategory').value;
+            const filterType = document.getElementById('filterType').value;
+
+            // Sort transactions chronologically (oldest first) to calculate running balance correctly
+            const chronologicalList = [...transactions].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+            // Calculate running balance for each
+            let runningBalance = 0;
+            let totalIn = 0;
+            let totalOut = 0;
+
+            let houseTotal = 0;
+            let businessTotal = 0;
+            let miscTotal = 0;
+
+            const calculatedList = chronologicalList.map(tx => {
+                if (tx.type === 'transfer') {
+                    runningBalance += tx.amount;
+                    totalIn += tx.amount;
+                } else {
+                    runningBalance -= tx.amount;
+                    totalOut += tx.amount;
+
+                    // Breakdown totals
+                    if (tx.category === 'House Payment') houseTotal += tx.amount;
+                    if (tx.category === 'Business') businessTotal += tx.amount;
+                    if (tx.category === 'Miscellaneous') miscTotal += tx.amount;
+                }
+                return { ...tx, currentRunningBalance: runningBalance };
+            });
+
+            // Update top cards
+            document.getElementById('netBalance').textContent = formatCurrency(runningBalance);
+            document.getElementById('totalInflow').textContent = formatCurrency(totalIn);
+            document.getElementById('totalOutflow').textContent = formatCurrency(totalOut);
+
+            document.getElementById('categoryHouseTotal').textContent = formatCurrency(houseTotal);
+            document.getElementById('categoryBusinessTotal').textContent = formatCurrency(businessTotal);
+            document.getElementById('categoryMiscTotal').textContent = formatCurrency(miscTotal);
+
+            // Reverse back for display (newest entries on top)
+            const displayList = [...calculatedList].reverse().filter(tx => {
+                const matchesSearch = tx.description.toLowerCase().includes(searchKeyword) || 
+                                     (tx.refNo && tx.refNo.toLowerCase().includes(searchKeyword)) ||
+                                     tx.payer.toLowerCase().includes(searchKeyword) ||
+                                     tx.recipient.toLowerCase().includes(searchKeyword);
+                
+                const matchesCategory = filterCat === 'ALL' || tx.category === filterCat;
+                const matchesType = filterType === 'ALL' || tx.type === filterType;
+
+                return matchesSearch && matchesCategory && matchesType;
+            });
+
+            document.getElementById('transactionCount').textContent = `${displayList.length} Entries`;
+
+            if (displayList.length === 0) {
+                emptyState.classList.remove('hidden');
+            } else {
+                emptyState.classList.add('hidden');
+                displayList.forEach(tx => {
+                    const tr = document.createElement('tr');
+                    tr.className = "hover:bg-slate-50/80 transition-colors";
+
+                    // Category Pill Styles
+                    let catBadgeClass = "bg-slate-100 text-slate-700";
+                    if (tx.category === 'Transfer') catBadgeClass = "bg-emerald-50 text-emerald-700 border border-emerald-200/60";
+                    else if (tx.category === 'House Payment') catBadgeClass = "bg-blue-50 text-blue-700 border border-blue-200/60";
+                    else if (tx.category === 'Business') catBadgeClass = "bg-amber-50 text-amber-700 border border-amber-200/60";
+                    else if (tx.category === 'Miscellaneous') catBadgeClass = "bg-purple-50 text-purple-700 border border-purple-200/60";
+
+                    const isInflow = tx.type === 'transfer';
+
+                    tr.innerHTML = `
+                        <td class="py-3 px-4 font-medium text-xs text-slate-600 whitespace-nowrap">${formatDate(tx.date)}</td>
+                        <td class="py-3 px-4">
+                            <span class="inline-block px-2.5 py-1 rounded-full text-[11px] font-semibold ${catBadgeClass}">
+                                ${tx.category}
+                            </span>
+                        </td>
+                        <td class="py-3 px-4">
+                            <div class="font-medium text-slate-900 text-xs">${escapeHTML(tx.description)}</div>
+                            ${tx.refNo ? `<div class="text-[10px] text-slate-400">Ref: ${escapeHTML(tx.refNo)}</div>` : ''}
+                        </td>
+                        <td class="py-3 px-4 text-xs text-slate-500 whitespace-nowrap">
+                            <span class="text-slate-700 font-medium">${escapeHTML(tx.payer)}</span> 
+                            <i data-lucide="arrow-right" class="inline w-3 h-3 text-slate-400 mx-0.5"></i> 
+                            <span class="text-slate-700 font-medium">${escapeHTML(tx.recipient)}</span>
+                        </td>
+                        <td class="py-3 px-4 text-right font-semibold text-xs text-emerald-600 whitespace-nowrap">
+                            ${isInflow ? '+' + formatCurrency(tx.amount) : '-'}
+                        </td>
+                        <td class="py-3 px-4 text-right font-semibold text-xs text-rose-600 whitespace-nowrap">
+                            ${!isInflow ? '-' + formatCurrency(tx.amount) : '-'}
+                        </td>
+                        <td class="py-3 px-4 text-right font-bold text-xs ${tx.currentRunningBalance < 0 ? 'text-rose-600' : 'text-slate-800'} whitespace-nowrap">
+                            ${formatCurrency(tx.currentRunningBalance)}
+                        </td>
+                        <td class="py-3 px-4 text-center whitespace-nowrap">
+                            <button onclick="promptDelete('${tx.id}')" class="text-slate-400 hover:text-rose-600 p-1 rounded-lg hover:bg-rose-50 transition-colors" title="Delete Entry">
+                                <i data-lucide="trash" class="w-4 h-4"></i>
+                            </button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+
+            lucide.createIcons();
+        }
+
+        // Filter trigger
+        function filterTransactions() {
+            renderLedger();
+        }
+
+        // Chart Initialization
+        function initChart() {
+            const ctx = document.getElementById('categoryChart').getContext('2d');
+            
+            categoryChartInstance = new Chart(ctx, {
+                type: 'doughnut',
+                data: getChartData(),
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                boxWidth: 12,
+                                font: { size: 10, family: 'Inter' }
+                            }
+                        }
+                    },
+                    cutout: '70%'
+                }
+            });
+        }
+
+        function updateChart() {
+            if (categoryChartInstance) {
+                categoryChartInstance.data = getChartData();
+                categoryChartInstance.update();
+            }
+        }
+
+        function getChartData() {
+            let house = 0, business = 0, misc = 0;
+            transactions.forEach(t => {
+                if (t.type === 'expense') {
+                    if (t.category === 'House Payment') house += t.amount;
+                    if (t.category === 'Business') business += t.amount;
+                    if (t.category === 'Miscellaneous') misc += t.amount;
+                }
+            });
+
+            return {
+                labels: ['House Payment', 'Business', 'Miscellaneous'],
+                datasets: [{
+                    data: [house, business, misc],
+                    backgroundColor: ['#3b82f6', '#f59e0b', '#a855f7'],
+                    borderWidth: 0
+                }]
+            };
+        }
+
+        // Helper Functions
+        function formatCurrency(val) {
+            return new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' }).format(val);
+        }
+
+        function formatDate(dateStr) {
+            if (!dateStr) return '';
+            const d = new Date(dateStr + 'T00:00:00');
+            return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        }
+
+        function escapeHTML(str) {
+            if (!str) return '';
+            return str.replace(/[&<>'"]/g, 
+                tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag)
+            );
+        }
+
+        // Custom Modal Utilities
+        function showModal(title, message, iconName = 'info', colorScheme = 'indigo', isConfirm = false) {
+            document.getElementById('modalTitle').textContent = title;
+            document.getElementById('modalMessage').textContent = message;
+
+            const iconContainer = document.getElementById('modalIconContainer');
+            const modalIcon = document.getElementById('modalIcon');
+            const modalActions = document.getElementById('modalActions');
+
+            // Apply theme color
+            iconContainer.className = `w-12 h-12 rounded-full mx-auto flex items-center justify-center bg-${colorScheme}-50 text-${colorScheme}-600`;
+            modalIcon.setAttribute('data-lucide', iconName);
+
+            if (isConfirm) {
+                modalActions.innerHTML = `
+                    <button onclick="closeModal()" class="w-1/2 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium text-xs rounded-xl transition-colors">Cancel</button>
+                    <button onclick="confirmDelete()" class="w-1/2 py-2 bg-rose-600 hover:bg-rose-700 text-white font-medium text-xs rounded-xl transition-colors">Delete</button>
+                `;
+            } else {
+                modalActions.innerHTML = `
+                    <button onclick="closeModal()" class="w-full py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium text-xs rounded-xl transition-colors">OK</button>
+                `;
+            }
+
+            document.getElementById('modalOverlay').classList.remove('hidden');
+            lucide.createIcons();
+        }
+
+        function closeModal() {
+            document.getElementById('modalOverlay').classList.add('hidden');
+        }
+
+        function clearAllDataPrompt() {
+            showModal('Reset All Data', 'Are you sure you want to clear all ledger records? This cannot be undone.', 'trash-2', 'rose', false);
+            const modalActions = document.getElementById('modalActions');
+            modalActions.innerHTML = `
+                <button onclick="closeModal()" class="w-1/2 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium text-xs rounded-xl transition-colors">Cancel</button>
+                <button onclick="executeClearAll()" class="w-1/2 py-2 bg-rose-600 hover:bg-rose-700 text-white font-medium text-xs rounded-xl transition-colors">Clear All</button>
+            `;
+        }
+
+        function executeClearAll() {
+            transactions = [];
+            localStorage.removeItem('couple_ledger_data');
+            renderLedger();
+            updateChart();
+            closeModal();
+        }
+
+        // Export to CSV
+        function exportToCSV() {
+            if (transactions.length === 0) {
+                showModal('Export Failed', 'There are no transactions available to export.', 'alert-circle', 'amber');
+                return;
+            }
+
+            let csvContent = "data:text/csv;charset=utf-8,";
+            csvContent += "Date,Type,Category,Description,Paid By,Received By,Amount (PHP),Ref No\n";
+
+            transactions.forEach(t => {
+                const cleanDesc = `"${(t.description || '').replace(/"/g, '""')}"`;
+                const cleanPayer = `"${(t.payer || '').replace(/"/g, '""')}"`;
+                const cleanRecipient = `"${(t.recipient || '').replace(/"/g, '""')}"`;
+                const cleanRef = `"${(t.refNo || '').replace(/"/g, '""')}"`;
+
+                csvContent += `${t.date},${t.type},${t.category},${cleanDesc},${cleanPayer},${cleanRecipient},${t.amount},${cleanRef}\n`;
+            });
+
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", `Home_Ledger_${new Date().toISOString().split('T')[0]}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+    </script>
+</body>
+</html>
